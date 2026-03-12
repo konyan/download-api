@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Download Dramabox episode videos by bookId.
+Download ShortMax episode videos by shortPlayId.
 
 Folder output format:
-  <output>/<bookId>/
+    <output>/<shortPlayId>/
     video_info.json         # raw API response
     episodes.json           # normalized episode list (best effort)
     episodes/
@@ -15,8 +15,8 @@ Folder output format:
                 ...
 
 Examples:
-  python download_videos.py --book-id 42000007194
-  python download_videos.py --csv book_ids.csv --output ./downloads
+    python shortmax-download_videos.py --short-play-id 17329
+    python shortmax-download_videos.py --csv shortplay_ids.csv --output ./downloads
 """
 
 from __future__ import annotations
@@ -32,8 +32,10 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-DETAIL_API_URL = "https://api.sansekai.my.id/api/dramabox/detail?bookId={book_id}"
-ALLEPISODE_API_URL = "https://api.sansekai.my.id/api/dramabox/allepisode?bookId={book_id}"
+DETAIL_API_URL = "https://api.sansekai.my.id/api/shortmax/detail?shortPlayId={short_play_id}"
+ALLEPISODE_API_URL = "https://api.sansekai.my.id/api/shortmax/allepisode?shortPlayId={short_play_id}"
+SHORTMAX_REFERER = "https://www.shorttv.live/"
+SHORTMAX_ORIGIN = "https://www.shorttv.live"
 CHUNK_SIZE = 1024 * 1024
 
 SUCCESS_VALUES = {"1", "true", "success", "ok", "done", "yes"}
@@ -57,26 +59,26 @@ def fetch_json_from_url(url: str, timeout: int = 30, headers: Optional[Dict[str,
     return json.loads(data)
 
 
-def fetch_detail_json(book_id: str, timeout: int = 30) -> Any:
-    url = DETAIL_API_URL.format(book_id=book_id)
+def fetch_detail_json(short_play_id: str, timeout: int = 30) -> Any:
+    url = DETAIL_API_URL.format(short_play_id=short_play_id)
     return fetch_json_from_url(
         url,
         timeout=timeout,
         headers={
-            "referer": "https://www.dramaboxapp.com/",
-            "origin": "https://www.dramaboxapp.com",
+            "referer": SHORTMAX_REFERER,
+            "origin": SHORTMAX_ORIGIN,
         },
     )
 
 
-def fetch_allepisode_json(book_id: str, timeout: int = 30) -> Any:
-    url = ALLEPISODE_API_URL.format(book_id=book_id)
+def fetch_allepisode_json(short_play_id: str, timeout: int = 30) -> Any:
+    url = ALLEPISODE_API_URL.format(short_play_id=short_play_id)
     return fetch_json_from_url(
         url,
         timeout=timeout,
         headers={
-            "referer": "https://www.dramaboxapp.com/",
-            "origin": "https://www.dramaboxapp.com",
+            "referer": SHORTMAX_REFERER,
+            "origin": SHORTMAX_ORIGIN,
         },
     )
 
@@ -87,6 +89,12 @@ def _find_column(fieldnames: List[str], candidates: Tuple[str, ...]) -> Optional
         if candidate in field_map:
             return field_map[candidate]
     return None
+
+
+def unwrap_shortmax_data(payload: Any) -> Any:
+    if isinstance(payload, dict) and payload.get("status") == "ok" and "data" in payload:
+        return payload.get("data")
+    return payload
 
 
 def read_rows_from_csv(csv_path: Path) -> Tuple[List[Dict[str, str]], List[str]]:
@@ -104,12 +112,12 @@ def read_rows_from_csv(csv_path: Path) -> Tuple[List[Dict[str, str]], List[str]]
             return rows, fieldnames
 
     # Fallback: one ID per line if CSV has no headers. Build expected columns.
-    fieldnames = ["bookId", "check", "success_failed"]
+    fieldnames = ["shortPlayId", "check", "success_failed"]
     with csv_path.open("r", encoding="utf-8") as f:
         for line in f:
             value = line.strip().strip(",")
             if value and not value.lower().startswith("book"):
-                rows.append({"bookId": value, "check": "", "success_failed": ""})
+                rows.append({"shortPlayId": value, "check": "", "success_failed": ""})
 
     return rows, fieldnames
 
@@ -138,6 +146,7 @@ def should_process_csv_row(row: Dict[str, str], success_column: str) -> bool:
 
 
 def find_candidate_episode_lists(payload: Any) -> List[List[Dict[str, Any]]]:
+    payload = unwrap_shortmax_data(payload)
     candidates: List[List[Dict[str, Any]]] = []
 
     def has_episode_shape(item: Dict[str, Any]) -> bool:
@@ -190,6 +199,11 @@ def _looks_like_video_url(value: Any) -> bool:
 
 
 def extract_video_url(item: Dict[str, Any]) -> Optional[str]:
+    shortmax_video_urls = collect_quality_video_urls_from_chapter(item)
+    if shortmax_video_urls:
+        best_quality = max(shortmax_video_urls)
+        return shortmax_video_urls[best_quality]
+
     preferred_keys = [
         "videoUrl",
         "video_url",
@@ -225,6 +239,21 @@ def extract_video_url(item: Dict[str, Any]) -> Optional[str]:
 
 
 def collect_quality_video_urls_from_chapter(chapter: Dict[str, Any]) -> Dict[int, str]:
+    video_url_map = chapter.get("videoUrl")
+    if isinstance(video_url_map, dict):
+        quality_urls: Dict[int, str] = {}
+        for key, value in video_url_map.items():
+            if not isinstance(value, str) or not value.startswith(("http://", "https://")):
+                continue
+
+            match = re.search(r"(\d+)", str(key))
+            if not match:
+                continue
+            quality_urls[int(match.group(1))] = value
+
+        if quality_urls:
+            return quality_urls
+
     cdn_list = chapter.get("cdnList")
     if not isinstance(cdn_list, list):
         return {}
@@ -287,7 +316,7 @@ def extract_subtitle_url(item: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_episode_number(item: Dict[str, Any], default_index: int) -> int:
-    number_keys = ["episode", "episodeNo", "episode_num", "ep", "sort", "index", "num"]
+    number_keys = ["episode", "episodeNo", "episodeNumber", "episode_num", "ep", "sort", "index", "num"]
     for key in number_keys:
         value = item.get(key)
         if isinstance(value, int):
@@ -307,6 +336,28 @@ def extract_episode_number(item: Dict[str, Any], default_index: int) -> int:
 
 
 def normalize_episodes(payload: Any, preferred_quality: int = 720) -> List[Dict[str, Any]]:
+    payload = unwrap_shortmax_data(payload)
+
+    if isinstance(payload, dict):
+        episodes_payload = payload.get("episodes")
+        if isinstance(episodes_payload, list) and all(isinstance(x, dict) for x in episodes_payload):
+            normalized: List[Dict[str, Any]] = []
+            for i, item in enumerate(episodes_payload, start=1):
+                ep_no = extract_episode_number(item, default_index=i)
+                quality_urls = collect_quality_video_urls_from_chapter(item)
+                normalized.append(
+                    {
+                        "episode": ep_no,
+                        "quality_urls": quality_urls,
+                        "video_url": pick_video_url_from_chapter(item, preferred_quality=preferred_quality),
+                        "subtitle_url": extract_subtitle_url(item),
+                        "raw": item,
+                    }
+                )
+
+            normalized.sort(key=lambda x: x["episode"])
+            return normalized
+
     # Preferred path: explicit episode list payload shape from API.
     if isinstance(payload, list) and payload and all(isinstance(x, dict) for x in payload):
         if any("chapterId" in x or "cdnList" in x for x in payload):
@@ -387,28 +438,28 @@ def download_file(url: str, dest: Path, timeout: int = 60) -> None:
             out.write(chunk)
 
 
-def process_book_id(
-    book_id: str,
+def process_short_play_id(
+    short_play_id: str,
     output_dir: Path,
     skip_existing: bool = True,
     retry_count: int = 3,
     retry_sleep_sec: float = 1.0,
     preferred_quality: int = 720,
 ) -> Tuple[int, int, int]:
-    print(f"\n[INFO] Processing bookId={book_id}")
-    book_dir = output_dir / str(book_id)
+    print(f"\n[INFO] Processing shortPlayId={short_play_id}")
+    book_dir = output_dir / str(short_play_id)
     episodes_dir = book_dir / "episodes"
     episodes_dir.mkdir(parents=True, exist_ok=True)
 
     detail_payload: Optional[Any] = None
     detail_error: Optional[str] = None
     try:
-        detail_payload = fetch_detail_json(book_id)
+        detail_payload = fetch_detail_json(short_play_id)
     except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as err:
         detail_error = str(err)
-        print(f"[WARN] Failed to fetch detail endpoint for bookId {book_id}: {err}")
+        print(f"[WARN] Failed to fetch detail endpoint for shortPlayId {short_play_id}: {err}")
 
-    payload = fetch_allepisode_json(book_id)
+    payload = fetch_allepisode_json(short_play_id)
 
     if detail_payload is not None:
         detail_json_path = book_dir / "book_detail.json"
@@ -417,7 +468,7 @@ def process_book_id(
     elif detail_error is not None:
         detail_error_path = book_dir / "book_detail_error.json"
         detail_error_path.write_text(
-            json.dumps({"book_id": book_id, "error": detail_error}, ensure_ascii=False, indent=2),
+            json.dumps({"short_play_id": short_play_id, "error": detail_error}, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
         print(f"[INFO] Saved detail API error info: {detail_error_path}")
@@ -437,7 +488,7 @@ def process_book_id(
             json.dumps(
                 [
                     {
-                        "book_id": book_id,
+                        "short_play_id": short_play_id,
                         "error": "No episode list found in API response",
                     }
                 ],
@@ -598,8 +649,8 @@ def process_book_id(
     return downloaded, skipped, failed
 
 
-def is_book_folder_already_downloaded(book_id: str, output_dir: Path) -> bool:
-    book_dir = output_dir / str(book_id)
+def is_short_play_folder_already_downloaded(short_play_id: str, output_dir: Path) -> bool:
+    book_dir = output_dir / str(short_play_id)
     if not book_dir.exists() or not book_dir.is_dir():
         return False
 
@@ -614,16 +665,18 @@ def is_book_folder_already_downloaded(book_id: str, output_dir: Path) -> bool:
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download Dramabox episode videos by bookId")
+    parser = argparse.ArgumentParser(description="Download ShortMax episode videos by shortPlayId")
     parser.add_argument(
+        "--short-play-id",
         "--book-id",
+        dest="short_play_id",
         action="append",
-        help="bookId to process. Use multiple times for multiple ids.",
+        help="shortPlayId to process. Use multiple times for multiple ids. --book-id is kept as an alias.",
     )
     parser.add_argument(
         "--csv",
         type=Path,
-        help="CSV file with book IDs. Header can be: bookId, book_id, or id.",
+        help="CSV file with IDs. Header can be: shortPlayId, short_play_id, bookId, book_id, or id.",
     )
     parser.add_argument(
         "--output",
@@ -660,19 +713,19 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[Iterable[str]] = None) -> int:
     args = parse_args(argv)
 
-    book_ids: Set[str] = set()
+    short_play_ids: Set[str] = set()
     csv_rows: List[Dict[str, str]] = []
     csv_fieldnames: List[str] = []
-    book_id_col: Optional[str] = None
+    short_play_id_col: Optional[str] = None
     check_col: Optional[str] = None
     success_col: Optional[str] = None
 
-    if args.book_id:
-        for raw in args.book_id:
+    if args.short_play_id:
+        for raw in args.short_play_id:
             for item in str(raw).split(","):
                 value = item.strip()
                 if value:
-                    book_ids.add(value)
+                    short_play_ids.add(value)
 
     if args.csv:
         if not args.csv.exists():
@@ -689,27 +742,27 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         if "success_failed" not in [name.lower() for name in csv_fieldnames] and "success" not in [name.lower() for name in csv_fieldnames]:
             csv_fieldnames.append("success_failed")
 
-        book_id_col = _find_column(csv_fieldnames, ("bookid", "book_id", "id"))
+        short_play_id_col = _find_column(csv_fieldnames, ("shortplayid", "short_play_id", "bookid", "book_id", "id"))
         check_col = _find_column(csv_fieldnames, ("check",)) or "check"
         success_col = _find_column(csv_fieldnames, ("success_failed", "success")) or "success_failed"
 
-        if book_id_col is None:
-            print(f"[ERROR] CSV must contain bookId/book_id/id column: {args.csv}")
+        if short_play_id_col is None:
+            print(f"[ERROR] CSV must contain shortPlayId/short_play_id/bookId/book_id/id column: {args.csv}")
             return 1
 
         for row in csv_rows:
-            value = (row.get(book_id_col) or "").strip()
+            value = (row.get(short_play_id_col) or "").strip()
             if not value:
                 continue
             if should_process_csv_row(row, success_col):
-                book_ids.add(value)
+                short_play_ids.add(value)
 
-        if not book_ids:
+        if not short_play_ids:
             print(f"[INFO] No pending/failed rows to process in CSV: {args.csv}")
             return 0
 
-    if not book_ids:
-        print("[ERROR] Provide at least one --book-id or --csv")
+    if not short_play_ids:
+        print("[ERROR] Provide at least one --short-play-id or --csv")
         return 1
 
     args.output.mkdir(parents=True, exist_ok=True)
@@ -722,21 +775,21 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     total_skipped = 0
     total_failed = 0
 
-    for book_id in sorted(book_ids):
+    for short_play_id in sorted(short_play_ids):
         try:
-            if skip_existing and is_book_folder_already_downloaded(book_id, args.output):
-                print(f"\n[SKIP] bookId={book_id} already has output folder, skipping")
-                if args.csv and csv_rows and book_id_col and check_col and success_col:
+            if skip_existing and is_short_play_folder_already_downloaded(short_play_id, args.output):
+                print(f"\n[SKIP] shortPlayId={short_play_id} already has output folder, skipping")
+                if args.csv and csv_rows and short_play_id_col and check_col and success_col:
                     for row in csv_rows:
-                        if (row.get(book_id_col) or "").strip() == book_id:
+                        if (row.get(short_play_id_col) or "").strip() == short_play_id:
                             row[check_col] = "success"
                             row[success_col] = "success"
                     write_rows_to_csv(args.csv, csv_rows, csv_fieldnames)
                 continue
 
-            print(f"\n[PROCESSING] bookId={book_id}")
-            downloaded, skipped, failed = process_book_id(
-                book_id,
+            print(f"\n[PROCESSING] shortPlayId={short_play_id}")
+            downloaded, skipped, failed = process_short_play_id(
+                short_play_id,
                 args.output,
                 skip_existing=skip_existing,
                 retry_count=retry_count,
@@ -747,24 +800,24 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             total_skipped += skipped
             total_failed += failed
 
-            if args.csv and csv_rows and book_id_col and check_col and success_col:
+            if args.csv and csv_rows and short_play_id_col and check_col and success_col:
                 for row in csv_rows:
-                    if (row.get(book_id_col) or "").strip() == book_id:
+                    if (row.get(short_play_id_col) or "").strip() == short_play_id:
                         row[check_col] = "success"
                         row[success_col] = "success" if failed == 0 else "failed"
                 write_rows_to_csv(args.csv, csv_rows, csv_fieldnames)
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as err:
-            print(f"[ERROR] Failed processing bookId {book_id}: {err}")
+            print(f"[ERROR] Failed processing shortPlayId {short_play_id}: {err}")
             total_failed += 1
-            if args.csv and csv_rows and book_id_col and check_col and success_col:
+            if args.csv and csv_rows and short_play_id_col and check_col and success_col:
                 for row in csv_rows:
-                    if (row.get(book_id_col) or "").strip() == book_id:
+                    if (row.get(short_play_id_col) or "").strip() == short_play_id:
                         row[check_col] = "failed"
                         row[success_col] = "failed"
                 write_rows_to_csv(args.csv, csv_rows, csv_fieldnames)
 
     print("\n[SUMMARY]")
-    print(f"Book IDs: {len(book_ids)}")
+    print(f"Short play IDs: {len(short_play_ids)}")
     print(f"Downloaded files: {total_downloaded}")
     print(f"Skipped/missing: {total_skipped}")
     print(f"Failed downloads: {total_failed}")
