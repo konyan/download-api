@@ -598,6 +598,21 @@ def process_book_id(
     return downloaded, skipped, failed
 
 
+def is_book_folder_already_downloaded(book_id: str, output_dir: Path) -> bool:
+    book_dir = output_dir / str(book_id)
+    if not book_dir.exists() or not book_dir.is_dir():
+        return False
+
+    # Treat as already processed when key output artifacts exist.
+    if (book_dir / "episodes").exists():
+        return True
+    if (book_dir / "video_info.json").exists():
+        return True
+    if (book_dir / "episodes.json").exists():
+        return True
+    return False
+
+
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Dramabox episode videos by bookId")
     parser.add_argument(
@@ -709,6 +724,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     for book_id in sorted(book_ids):
         try:
+            if skip_existing and is_book_folder_already_downloaded(book_id, args.output):
+                print(f"\n[SKIP] bookId={book_id} already has output folder, skipping")
+                if args.csv and csv_rows and book_id_col and check_col and success_col:
+                    for row in csv_rows:
+                        if (row.get(book_id_col) or "").strip() == book_id:
+                            row[check_col] = "success"
+                            row[success_col] = "success"
+                    write_rows_to_csv(args.csv, csv_rows, csv_fieldnames)
+                continue
+
             print(f"\n[PROCESSING] bookId={book_id}")
             downloaded, skipped, failed = process_book_id(
                 book_id,
