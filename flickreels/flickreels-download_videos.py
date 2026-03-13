@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Download Dramabox episode videos by bookId.
+Download FlickReels episode videos by ID.
 
 Folder output format:
-  <output>/<bookId>/
+  <output>/<id>/
     video_info.json         # raw API response
+    drama_info.json         # drama metadata extracted from API response
+    cover/drama_cover.jpg   # drama-level cover image
     episodes.json           # normalized episode list (best effort)
     episodes/
             episode_001/
                 1080p/episode_001_1080p.mp4
                 720p/episode_001_720p.mp4
+                chapter_cover.jpg
                 subtitles/episode_001.vtt
             episode_002/
                 ...
@@ -33,8 +36,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-DETAIL_API_URL = "https://api.sansekai.my.id/api/dramabox/detail?bookId={book_id}"
-ALLEPISODE_API_URL = "https://api.sansekai.my.id/api/dramabox/allepisode?bookId={book_id}"
+DETAIL_AND_EPISODES_API_URL = "https://api.sansekai.my.id/api/flickreels/detailAndAllEpisode?id={book_id}"
 CHUNK_SIZE = 1024 * 1024
 
 SUCCESS_VALUES = {"1", "true", "success", "ok", "done", "yes"}
@@ -58,26 +60,14 @@ def fetch_json_from_url(url: str, timeout: int = 30, headers: Optional[Dict[str,
     return json.loads(data)
 
 
-def fetch_detail_json(book_id: str, timeout: int = 30) -> Any:
-    url = DETAIL_API_URL.format(book_id=book_id)
+def fetch_detail_and_episodes_json(book_id: str, timeout: int = 30) -> Any:
+    url = DETAIL_AND_EPISODES_API_URL.format(book_id=book_id)
     return fetch_json_from_url(
         url,
         timeout=timeout,
         headers={
-            "referer": "https://www.dramaboxapp.com/",
-            "origin": "https://www.dramaboxapp.com",
-        },
-    )
-
-
-def fetch_allepisode_json(book_id: str, timeout: int = 30) -> Any:
-    url = ALLEPISODE_API_URL.format(book_id=book_id)
-    return fetch_json_from_url(
-        url,
-        timeout=timeout,
-        headers={
-            "referer": "https://www.dramaboxapp.com/",
-            "origin": "https://www.dramaboxapp.com",
+            "referer": "https://www.flickreels.net/",
+            "origin": "https://www.flickreels.net",
         },
     )
 
@@ -288,13 +278,27 @@ def extract_subtitle_url(item: Dict[str, Any]) -> Optional[str]:
 
 
 def extract_episode_number(item: Dict[str, Any], default_index: int) -> int:
-    number_keys = ["episode", "episodeNo", "episode_num", "ep", "sort", "index", "num"]
+    raw = item.get("raw")
+    if isinstance(raw, dict):
+        raw_chapter_num = raw.get("chapter_num")
+        if isinstance(raw_chapter_num, int):
+            return raw_chapter_num
+        if isinstance(raw_chapter_num, str) and raw_chapter_num.strip().isdigit():
+            return int(raw_chapter_num.strip())
+
+    number_keys = ["episode", "episodeNo", "episode_num", "ep", "sort", "num"]
     for key in number_keys:
         value = item.get(key)
         if isinstance(value, int):
             return value
         if isinstance(value, str) and value.strip().isdigit():
             return int(value.strip())
+
+    index_value = item.get("index")
+    if isinstance(index_value, int):
+        return index_value + 1
+    if isinstance(index_value, str) and index_value.strip().isdigit():
+        return int(index_value.strip()) + 1
 
     text_keys = ["title", "name"]
     for key in text_keys:
@@ -308,6 +312,32 @@ def extract_episode_number(item: Dict[str, Any], default_index: int) -> int:
 
 
 def normalize_episodes(payload: Any, preferred_quality: int = 720) -> List[Dict[str, Any]]:
+    # FlickReels shape: {"drama": {...}, "episodes": [...]}
+    if isinstance(payload, dict):
+        payload_episodes = payload.get("episodes")
+        if isinstance(payload_episodes, list) and payload_episodes and all(isinstance(x, dict) for x in payload_episodes):
+            normalized: List[Dict[str, Any]] = []
+            for i, item in enumerate(payload_episodes, start=1):
+                raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+                chapter_cover_url: Optional[str] = None
+                raw_cover = raw.get("chapter_cover") if isinstance(raw, dict) else None
+                if isinstance(raw_cover, str) and raw_cover.startswith(("http://", "https://")):
+                    chapter_cover_url = raw_cover
+
+                normalized.append(
+                    {
+                        "episode": extract_episode_number(item, default_index=i),
+                        "quality_urls": collect_quality_video_urls_from_chapter(item),
+                        "video_url": extract_video_url(item),
+                        "chapter_cover_url": chapter_cover_url,
+                        "subtitle_url": extract_subtitle_url(item),
+                        "raw": item,
+                    }
+                )
+
+            normalized.sort(key=lambda x: x["episode"])
+            return normalized
+
     # Preferred path: explicit episode list payload shape from API.
     if isinstance(payload, list) and payload and all(isinstance(x, dict) for x in payload):
         if any("chapterId" in x or "cdnList" in x for x in payload):
@@ -324,6 +354,7 @@ def normalize_episodes(payload: Any, preferred_quality: int = 720) -> List[Dict[
                         "episode": ep_no,
                         "quality_urls": collect_quality_video_urls_from_chapter(item),
                         "video_url": pick_video_url_from_chapter(item, preferred_quality=preferred_quality),
+                        "chapter_cover_url": item.get("chapterCover") if isinstance(item.get("chapterCover"), str) else None,
                         "subtitle_url": extract_subtitle_url(item),
                         "raw": item,
                     }
@@ -349,6 +380,7 @@ def normalize_episodes(payload: Any, preferred_quality: int = 720) -> List[Dict[
                 "episode": ep_no,
                 "video_url": url,
                 "quality_urls": {},
+                "chapter_cover_url": None,
                 "subtitle_url": extract_subtitle_url(item),
                 "raw": item,
             }
@@ -378,6 +410,15 @@ def subtitle_extension_from_url(url: str) -> str:
     return ".vtt"
 
 
+def image_extension_from_url(url: str) -> str:
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+        if path.endswith(ext):
+            return ext
+    return ".jpg"
+
+
 def download_file(url: str, dest: Path, timeout: int = 60) -> None:
     req = Request(url, method="GET", headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=timeout) as resp, dest.open("wb") as out:
@@ -386,6 +427,30 @@ def download_file(url: str, dest: Path, timeout: int = 60) -> None:
             if not chunk:
                 break
             out.write(chunk)
+
+
+def download_with_retry(
+    url: str,
+    target: Path,
+    retry_count: int,
+    retry_sleep_sec: float,
+    label: str,
+) -> Tuple[bool, Optional[Exception]]:
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max(1, retry_count) + 1):
+        try:
+            print(f"[DOWNLOADING] {label} (attempt {attempt}/{retry_count}): {url}")
+            download_file(url, target)
+            print(f"[DONE] {target}")
+            return True, None
+        except (HTTPError, URLError, TimeoutError, HTTPException, OSError) as err:
+            last_err = err
+            print(f"[WARN] {label} download failed on attempt {attempt}: {err}")
+            if target.exists():
+                target.unlink(missing_ok=True)
+            if attempt < retry_count:
+                time.sleep(max(0.0, retry_sleep_sec))
+    return False, last_err
 
 
 def process_book_id(
@@ -398,34 +463,22 @@ def process_book_id(
 ) -> Tuple[int, int, int]:
     print(f"\n[INFO] Processing bookId={book_id}")
     book_dir = output_dir / str(book_id)
+    cover_dir = book_dir / "cover"
     episodes_dir = book_dir / "episodes"
+    cover_dir.mkdir(parents=True, exist_ok=True)
     episodes_dir.mkdir(parents=True, exist_ok=True)
 
-    detail_payload: Optional[Any] = None
-    detail_error: Optional[str] = None
-    try:
-        detail_payload = fetch_detail_json(book_id)
-    except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as err:
-        detail_error = str(err)
-        print(f"[WARN] Failed to fetch detail endpoint for bookId {book_id}: {err}")
-
-    payload = fetch_allepisode_json(book_id)
-
-    if detail_payload is not None:
-        detail_json_path = book_dir / "book_detail.json"
-        detail_json_path.write_text(json.dumps(detail_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"[INFO] Saved detail API response: {detail_json_path}")
-    elif detail_error is not None:
-        detail_error_path = book_dir / "book_detail_error.json"
-        detail_error_path.write_text(
-            json.dumps({"book_id": book_id, "error": detail_error}, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"[INFO] Saved detail API error info: {detail_error_path}")
+    payload = fetch_detail_and_episodes_json(book_id)
 
     raw_json_path = book_dir / "video_info.json"
     raw_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[INFO] Saved raw API response: {raw_json_path}")
+
+    drama_payload = payload.get("drama") if isinstance(payload, dict) else None
+    if isinstance(drama_payload, dict):
+        drama_json_path = book_dir / "drama_info.json"
+        drama_json_path.write_text(json.dumps(drama_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"[INFO] Saved drama metadata: {drama_json_path}")
 
     episodes = normalize_episodes(payload, preferred_quality=preferred_quality)
     episodes_json_path = book_dir / "episodes.json"
@@ -455,6 +508,41 @@ def process_book_id(
     skipped = 0
     failed = 0
     failed_items: List[Dict[str, Any]] = []
+
+    drama_cover_url: Optional[str] = None
+    if isinstance(drama_payload, dict):
+        cover_value = drama_payload.get("cover")
+        if isinstance(cover_value, str) and cover_value.startswith(("http://", "https://")):
+            drama_cover_url = cover_value
+
+    if drama_cover_url:
+        drama_cover_ext = image_extension_from_url(drama_cover_url)
+        drama_cover_target = cover_dir / f"drama_cover{drama_cover_ext}"
+        if skip_existing and drama_cover_target.exists() and drama_cover_target.stat().st_size > 0:
+            print(f"[SKIP] Cover exists: {drama_cover_target}")
+            skipped += 1
+        else:
+            ok, err = download_with_retry(
+                drama_cover_url,
+                drama_cover_target,
+                retry_count=retry_count,
+                retry_sleep_sec=retry_sleep_sec,
+                label="Drama cover",
+            )
+            if ok:
+                downloaded += 1
+            else:
+                failed += 1
+                failed_items.append(
+                    {
+                        "episode": None,
+                        "video_url": drama_cover_url,
+                        "quality": "cover",
+                        "filename": str(drama_cover_target.relative_to(book_dir)),
+                        "error": str(err) if err else "unknown error",
+                    }
+                )
+                print(f"[ERROR] Failed drama cover download after {retry_count} attempts")
 
     for idx, ep in enumerate(episodes, start=1):
         quality_urls = ep.get("quality_urls")
@@ -494,6 +582,36 @@ def process_book_id(
         episode_dir = episodes_dir / f"episode_{int(ep_no):03d}"
         episode_dir.mkdir(parents=True, exist_ok=True)
 
+        chapter_cover_url = ep.get("chapter_cover_url")
+        if isinstance(chapter_cover_url, str) and chapter_cover_url.startswith(("http://", "https://")):
+            chapter_cover_ext = image_extension_from_url(chapter_cover_url)
+            chapter_cover_target = episode_dir / f"chapter_cover{chapter_cover_ext}"
+            if skip_existing and chapter_cover_target.exists() and chapter_cover_target.stat().st_size > 0:
+                print(f"[SKIP] Chapter cover exists: {chapter_cover_target}")
+                skipped += 1
+            else:
+                ok, err = download_with_retry(
+                    chapter_cover_url,
+                    chapter_cover_target,
+                    retry_count=retry_count,
+                    retry_sleep_sec=retry_sleep_sec,
+                    label=f"Episode {ep_no} chapter cover",
+                )
+                if ok:
+                    downloaded += 1
+                else:
+                    failed += 1
+                    failed_items.append(
+                        {
+                            "episode": ep_no,
+                            "video_url": chapter_cover_url,
+                            "quality": "chapter_cover",
+                            "filename": str(chapter_cover_target.relative_to(book_dir)),
+                            "error": str(err) if err else "unknown error",
+                        }
+                    )
+                    print(f"[ERROR] Failed chapter cover download for episode {ep_no} after {retry_count} attempts")
+
         for quality in sorted(usable_quality_urls.keys(), reverse=True):
             video_url = usable_quality_urls[quality]
             ext = file_extension_from_url(video_url)
@@ -507,32 +625,16 @@ def process_book_id(
                 skipped += 1
                 continue
 
-            success = False
-            last_err: Optional[Exception] = None
-            for attempt in range(1, max(1, retry_count) + 1):
-                try:
-                    print(
-                        f"[DOWNLOADING] Episode {ep_no} {quality}p "
-                        f"(attempt {attempt}/{retry_count}): {video_url}"
-                    )
-                    download_file(video_url, target)
-                    print(f"[DONE] {target}")
-                    downloaded += 1
-                    success = True
-                    break
-                except (HTTPError, URLError, TimeoutError, HTTPException, OSError) as err:
-                    last_err = err
-                    print(
-                        f"[WARN] Download failed for episode {ep_no} {quality}p "
-                        f"on attempt {attempt}: {err}"
-                    )
-                    # Remove partial file so retries and future runs do not keep truncated data.
-                    if target.exists():
-                        target.unlink(missing_ok=True)
-                    if attempt < retry_count:
-                        time.sleep(max(0.0, retry_sleep_sec))
-
-            if not success:
+            success, last_err = download_with_retry(
+                video_url,
+                target,
+                retry_count=retry_count,
+                retry_sleep_sec=retry_sleep_sec,
+                label=f"Episode {ep_no} {quality}p",
+            )
+            if success:
+                downloaded += 1
+            else:
                 failed += 1
                 failed_items.append(
                     {
@@ -557,28 +659,16 @@ def process_book_id(
                 print(f"[SKIP] Subtitle exists: {subtitle_target}")
                 skipped += 1
             else:
-                subtitle_success = False
-                subtitle_last_err: Optional[Exception] = None
-                for attempt in range(1, max(1, retry_count) + 1):
-                    try:
-                        print(
-                            f"[DOWNLOADING] Episode {ep_no} subtitle "
-                            f"(attempt {attempt}/{retry_count}): {subtitle_url}"
-                        )
-                        download_file(subtitle_url, subtitle_target)
-                        print(f"[DONE] {subtitle_target}")
-                        downloaded += 1
-                        subtitle_success = True
-                        break
-                    except (HTTPError, URLError, TimeoutError, HTTPException, OSError) as err:
-                        subtitle_last_err = err
-                        print(f"[WARN] Subtitle download failed for episode {ep_no} on attempt {attempt}: {err}")
-                        if subtitle_target.exists():
-                            subtitle_target.unlink(missing_ok=True)
-                        if attempt < retry_count:
-                            time.sleep(max(0.0, retry_sleep_sec))
-
-                if not subtitle_success:
+                subtitle_success, subtitle_last_err = download_with_retry(
+                    subtitle_url,
+                    subtitle_target,
+                    retry_count=retry_count,
+                    retry_sleep_sec=retry_sleep_sec,
+                    label=f"Episode {ep_no} subtitle",
+                )
+                if subtitle_success:
+                    downloaded += 1
+                else:
                     failed += 1
                     failed_items.append(
                         {
@@ -609,13 +699,15 @@ def is_book_folder_already_downloaded(book_id: str, output_dir: Path) -> bool:
         return True
     if (book_dir / "video_info.json").exists():
         return True
+    if (book_dir / "drama_info.json").exists():
+        return True
     if (book_dir / "episodes.json").exists():
         return True
     return False
 
 
 def parse_args(argv: Optional[Iterable[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Download Dramabox episode videos by bookId")
+    parser = argparse.ArgumentParser(description="Download FlickReels episode videos by id")
     parser.add_argument(
         "--book-id",
         action="append",
